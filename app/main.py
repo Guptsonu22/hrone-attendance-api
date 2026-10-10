@@ -4,9 +4,11 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
+import calendar
 import os
+import re
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date as date_cls, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 from typing import Optional
@@ -107,7 +109,7 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, attendance_da
     since shift_start, not since the grace period ended. Otherwise 0.
     """
     h_start, m_start = map(int, shift_start.split(":"))
-    att_d = date.fromisoformat(attendance_date)
+    att_d = date_cls.fromisoformat(attendance_date)
     start_dt = datetime(att_d.year, att_d.month, att_d.day, h_start, m_start, 0, tzinfo=IST)
     punch_in_ist = punch_in_utc.astimezone(IST)
     diff_sec = int((punch_in_ist - start_dt).total_seconds())
@@ -135,7 +137,7 @@ def compute_overtime(punch_out_utc: datetime, shift_end: str, shift_start: str, 
     For overnight shifts (shift_end <= shift_start), shift_end falls on the next day.
     """
     h_end, m_end = map(int, shift_end.split(":"))
-    att_d = date.fromisoformat(attendance_date)
+    att_d = date_cls.fromisoformat(attendance_date)
     end_dt = datetime(att_d.year, att_d.month, att_d.day, h_end, m_end, 0, tzinfo=IST)
     if shift_end <= shift_start:
         end_dt += timedelta(days=1)
@@ -210,7 +212,7 @@ class EmployeeIn(BaseModel):
     @classmethod
     def validate_joined_on(cls, v: str) -> str:
         try:
-            date.fromisoformat(v)
+            date_cls.fromisoformat(v)
         except Exception:
             raise ValueError("joined_on must be a valid date in YYYY-MM-DD format")
         return v
@@ -231,6 +233,23 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+
+
+class RegularizeRequest(BaseModel):
+    status: Optional[str] = None
+    punch_in: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+    punch_out: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            valid = {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}
+            if v not in valid:
+                raise ValueError("Invalid status")
+        return v
 
 
 # --------------------------------------------------------------------------- #
@@ -427,13 +446,13 @@ def list_attendance(
         date_q = {}
         if date_from:
             try:
-                date.fromisoformat(date_from)
+                date_cls.fromisoformat(date_from)
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid date_from format")
             date_q["$gte"] = date_from
         if date_to:
             try:
-                date.fromisoformat(date_to)
+                date_cls.fromisoformat(date_to)
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid date_to format")
             date_q["$lte"] = date_to
@@ -459,10 +478,266 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@app.patch("/attendance/{emp_code}/{date}", status_code=200)
+def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    # Validate date format (YYYY-MM-DD)
+    try:
+        date_cls.fromisoformat(date)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD")
+
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    existing = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Attendance record not found for date")
+
+    # Determine final status
+    final_status = body.status if body.status is not None else existing.get("status")
+
+    if final_status in ("ABSENT", "LEAVE"):
+        # Setting status ABSENT or LEAVE clears both punch times;
+        # supplying punch_in or punch_out with it is 422
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in and punch_out cannot be supplied when setting ABSENT or LEAVE",
+            )
+        final_punch_in = None
+        final_punch_out = None
+        final_work_hours = None
+        final_late_minutes = 0
+        final_overtime_minutes = 0
+        final_half_day = False
+    else:
+        # Presence status (PRESENT, WFH, ON_DUTY)
+        if body.punch_in is not None:
+            final_punch_in, _ = process_instant(body.punch_in)
+        else:
+            final_punch_in = existing.get("punch_in")
+
+        if final_punch_in is None:
+            raise HTTPException(status_code=422, detail="A presence status requires a punch_in")
+
+        # punch_in must stay on the record's attendance date (R1)
+        calc_att_date = get_attendance_date(final_punch_in, emp["shift_start"], emp["shift_end"])
+        if calc_att_date != date:
+            raise HTTPException(status_code=422, detail="punch_in must stay on the record's attendance date")
+
+        if body.punch_out is not None:
+            final_punch_out, _ = process_instant(body.punch_out)
+        else:
+            final_punch_out = existing.get("punch_out")
+
+        if final_punch_out is not None:
+            p_in = final_punch_in.replace(tzinfo=timezone.utc) if final_punch_in.tzinfo is None else final_punch_in
+            p_out = final_punch_out.replace(tzinfo=timezone.utc) if final_punch_out.tzinfo is None else final_punch_out
+            diff_sec = (p_out - p_in).total_seconds()
+            if diff_sec <= 0:
+                raise HTTPException(status_code=422, detail="punch_out must be strictly after punch_in")
+            if diff_sec > 24 * 3600:
+                raise HTTPException(status_code=422, detail="punch_out cannot be more than 24 hours after punch_in")
+
+            final_work_hours = compute_work_hours(p_in, p_out)
+            final_overtime_minutes = compute_overtime(p_out, emp["shift_end"], emp["shift_start"], date)
+            final_half_day = compute_half_day(final_work_hours)
+        else:
+            final_work_hours = None
+            final_overtime_minutes = 0
+            final_half_day = False
+
+        final_late_minutes = compute_late_minutes(final_punch_in, emp["shift_start"], date)
+
+    # Detect actual changes
+    changes = {}
+
+    if existing.get("status") != final_status:
+        changes["status"] = {"from": existing.get("status"), "to": final_status}
+
+    ex_pi = existing.get("punch_in")
+    if dt_to_epoch_ms(ex_pi) != dt_to_epoch_ms(final_punch_in):
+        changes["punch_in"] = {"from": ex_pi, "to": final_punch_in}
+
+    ex_po = existing.get("punch_out")
+    if dt_to_epoch_ms(ex_po) != dt_to_epoch_ms(final_punch_out):
+        changes["punch_out"] = {"from": ex_po, "to": final_punch_out}
+
+    if existing.get("work_hours") != final_work_hours:
+        changes["work_hours"] = {"from": existing.get("work_hours"), "to": final_work_hours}
+
+    if existing.get("late_minutes", 0) != final_late_minutes:
+        changes["late_minutes"] = {"from": existing.get("late_minutes", 0), "to": final_late_minutes}
+
+    if existing.get("overtime_minutes", 0) != final_overtime_minutes:
+        changes["overtime_minutes"] = {"from": existing.get("overtime_minutes", 0), "to": final_overtime_minutes}
+
+    if existing.get("half_day", False) != final_half_day:
+        changes["half_day"] = {"from": existing.get("half_day", False), "to": final_half_day}
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="Request changes nothing")
+
+    # Create history entry
+    at_dt, _ = process_instant()
+    history_entry = {
+        "at": at_dt,
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # Optimistic concurrency check: match current history length
+    current_history_len = len(existing.get("history") or [])
+
+    updated_doc = db.attendance_logs.find_one_and_update(
+        {
+            "_id": existing["_id"],
+            "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, current_history_len]},
+        },
+        {
+            "$set": {
+                "status": final_status,
+                "punch_in": final_punch_in,
+                "punch_out": final_punch_out,
+                "work_hours": final_work_hours,
+                "late_minutes": final_late_minutes,
+                "overtime_minutes": final_overtime_minutes,
+                "half_day": final_half_day,
+            },
+            "$push": {
+                "history": history_entry,
+            },
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated_doc:
+        raise HTTPException(status_code=409, detail="Concurrent edit conflict")
+
+    return format_attendance_record(updated_doc)
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    year, m = map(int, month.split("-"))
+    _, days_in_month = calendar.monthrange(year, m)
+    start_month_str = f"{month}-01"
+    end_month_str = f"{month}-{days_in_month:02d}"
+
+    start_d = date_cls(year, m, 1)
+    end_d = date_cls(year, m, days_in_month)
+    joined_d = date_cls.fromisoformat(emp["joined_on"])
+
+    # Calculate working_days (Mon-Fri from max(start_d, joined_d) to end_d)
+    if joined_d > end_d:
+        working_days = 0
+    else:
+        calc_start = max(start_d, joined_d)
+        cur = calc_start
+        working_days = 0
+        while cur <= end_d:
+            if cur.weekday() < 5:  # Mon=0, ..., Fri=4
+                working_days += 1
+            cur += timedelta(days=1)
+
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": start_month_str, "$lte": end_month_str},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$in": [
+                                            {"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}},
+                                            [2, 3, 4, 5, 6],  # Mon=2..Fri=6 in Mongo $dayOfWeek
+                                        ]
+                                    },
+                                ]
+                            },
+                            {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                            0.0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+    ]
+
+    agg_res = list(db.attendance_logs.aggregate(pipeline))
+
+    if agg_res:
+        row = agg_res[0]
+        raw_pres = float(row.get("present_days", 0.0))
+        present_days = float(Decimal(str(raw_pres)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        leave_days = int(row.get("leave_days", 0))
+        late_count = int(row.get("late_count", 0))
+        total_late_minutes = int(row.get("total_late_minutes", 0))
+        total_overtime_minutes = int(row.get("total_overtime_minutes", 0))
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        val = (Decimal(str(present_days)) / Decimal(working_days)) * Decimal(100)
+        attendance_pct = float(val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
