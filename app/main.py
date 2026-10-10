@@ -14,7 +14,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 # Load local .env if present; existing environment variables take precedence
@@ -39,9 +39,10 @@ async def lifespan(app: FastAPI):
 
     # Attendance logs unique natural key (emp_code, date) prevents race conditions
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
-    # Compound indexes for fast filtering and sorting at scale
+    # Compound indexes for fast filtering, punch-out matching, and sorting at scale
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("date", -1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     yield
 
 
@@ -227,6 +228,11 @@ class PunchInIn(BaseModel):
     status: PresenceStatus = PresenceStatus.PRESENT
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -324,6 +330,83 @@ def punch_in(body: PunchInIn):
     }
 
 
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    dt_utc, epoch_ms = process_instant(body.punched_at)
+
+    # 1. Check if there is an open record for this employee
+    open_record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None}, "punch_out": None},
+        sort=[("punch_in", -1)],
+    )
+
+    if open_record:
+        punch_in_utc = open_record["punch_in"]
+        if punch_in_utc.tzinfo is None:
+            punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
+
+        diff_seconds = (dt_utc - punch_in_utc).total_seconds()
+        if diff_seconds <= 0:
+            raise HTTPException(status_code=422, detail="punched_at must be strictly after punch_in")
+        if diff_seconds > 24 * 3600:
+            raise HTTPException(status_code=422, detail="punched_at cannot be more than 24 hours after punch_in")
+
+        record = open_record
+    else:
+        # No open record. Find the most recent record whose punch_in is <= dt_utc
+        record = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "punch_in": {"$ne": None, "$lte": dt_utc},
+            },
+            sort=[("punch_in", -1)],
+        )
+
+        if not record:
+            # Check if there is a record with punch_in > dt_utc
+            future_record = db.attendance_logs.find_one(
+                {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$gt": dt_utc}},
+                sort=[("punch_in", 1)],
+            )
+            if future_record:
+                raise HTTPException(status_code=422, detail="punched_at must be strictly after punch_in")
+            raise HTTPException(status_code=404, detail="No punch-in found")
+
+        # Record exists but was already punched out
+        raise HTTPException(status_code=409, detail="That record is already punched out")
+
+    # Compute derived values per R3 - R5
+    work_hours = compute_work_hours(punch_in_utc, dt_utc)
+    overtime_mins = compute_overtime(dt_utc, emp["shift_end"], emp["shift_start"], record["date"])
+    half_day = compute_half_day(work_hours)
+
+    # Atomic update to ensure two simultaneous punch-outs yield exactly one 200
+    updated_doc = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": dt_utc,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_mins,
+                "half_day": half_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated_doc:
+        raise HTTPException(status_code=409, detail="That record is already punched out")
+
+    return format_attendance_record(updated_doc)
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -378,7 +461,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
